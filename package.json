@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@dataform/core": "3.0.42",
+    "ga4-export-fixer": "https://github.com/DBlumen/ga4-export-fixer/archive/refs/tags/v0.9.0-googleads.2.tar.gz"
+  }
+}
