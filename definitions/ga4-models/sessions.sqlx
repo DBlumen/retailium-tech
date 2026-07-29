@@ -1,0 +1,74 @@
+config {
+  type: "incremental",
+  description: "GA4 sessions table",
+  schema: "ga4_export_fixer",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ['session_id', 'data_is_final'],
+  },
+  // include the same ga4_export_fixer tag that the event table has
+  tags: ['ga4_export_fixer']
+}
+
+js {
+  const { setPreOperations, helpers } = require('ga4-export-fixer');
+
+  // define the configuration for the pre-operations and date filters
+  const config = {
+    self: self(),
+    incremental: incremental(),
+    test: false,
+    testConfig: {
+        dateRangeStart: 'current_date()-1',
+        dateRangeEnd: 'current_date()',
+    },
+    // same options available for preOperations as in the event table
+    // https://github.com/tanelytics/ga4-export-fixer#preOperations
+    preOperations: {
+        // dateRangeStartFullRefresh: 'date(2000, 1, 1)',
+        // dateRangeEnd: 'current_date()',
+        // incrementalStartOverride: undefined,
+        // incrementalEndOverride: undefined,
+        // numberOfDaysToProcess: undefined
+    },
+  };
+}
+
+select
+  event_date,
+  session_id,
+  user_pseudo_id,
+  user_id,
+  -- the user_id field with a fallback to user_pseudo_id if null
+  merged_user_id,
+  any_value(session_traffic_source_last_click.cross_channel_campaign) as session_traffic_source,
+  any_value(landing_page) as landing_page,
+  countif(event_name = 'page_view') as page_views,
+  countif(event_name = 'book_demo') as book_demo_events,
+  countif(event_name = 'video_start') as video_start_events,
+  countif(event_name = 'video_finish') as video_finish_events,
+  count(*) as session_events,
+  sum(
+    ifnull(${helpers.unnestEventParam('engagement_time_msec', 'int')}, 0)
+  ) as session_engagement_time_msec,
+  current_datetime() as row_inserted_timestamp,
+  -- include the row's data_is_final status in the aggregation
+  min(data_is_final) as data_is_final
+from
+  -- reference the enhanced events table created earlier
+  ${ref('ga4_events_enhanced_543168832')}
+where
+  -- use the date range filter helper
+  -- reads the start and end dates from the same configuration that the pre-operations use
+  ${helpers.incrementalDateFilter(config)}
+group by 
+  event_date,
+  session_id,
+  user_pseudo_id,
+  user_id,
+  merged_user_id
+
+pre_operations {
+  -- the pre-operations needed for incremental refresh
+  ${setPreOperations(config)}
+}
