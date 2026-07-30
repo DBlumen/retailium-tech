@@ -1,0 +1,106 @@
+config {
+  type: "table",
+  description: "Event-scope page performance report built from page_view events. One row per date and page path. Session-level flags (engagement, conversions) are joined from the sessions model.",
+  schema: "marts_ga4",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ['page_path'],
+  },
+  tags: ['ga4_marts']
+}
+
+js {
+  const { helpers } = require('ga4-export-fixer');
+}
+
+with page_events as (
+  select
+    event_date,
+    session_id,
+    merged_user_id,
+    coalesce(page.path, '(not set)') as page_path,
+    ${helpers.unnestEventParam('page_title', 'string')} as page_title,
+    ifnull(${helpers.unnestEventParam('engagement_time_msec', 'int')}, 0) as engagement_time_msec,
+    ifnull(${helpers.unnestEventParam('entrances', 'int')}, 0) = 1 as is_entrance,
+    -- the last page_view of the session is its exit page
+    row_number() over (partition by session_id order by event_timestamp desc) = 1 as is_exit
+  from
+    ${ref('ga4_events_enhanced_543168832')}
+  where
+    event_name = 'page_view'
+),
+
+-- collapse to one row per page per session, so session-level metrics
+-- are not multiplied by the number of times the page was viewed
+page_session as (
+  select
+    e.event_date,
+    e.page_path,
+    e.session_id,
+    e.merged_user_id,
+    any_value(e.page_title) as page_title,
+    count(*) as page_views,
+    countif(e.is_entrance) as entrances,
+    countif(e.is_exit) as exits,
+    sum(e.engagement_time_msec) as engagement_time_msec,
+    any_value(s.session_engaged) as session_engaged,
+    any_value(s.conversion_events) as conversion_events
+  from
+    page_events e
+  left join
+    ${ref('sessions')} s
+    on e.session_id = s.session_id
+    and e.event_date = s.event_date
+  group by
+    e.event_date,
+    e.page_path,
+    e.session_id,
+    e.merged_user_id
+)
+
+select
+  event_date,
+  page_path,
+  any_value(page_title) as page_title,
+
+  -- volume
+  sum(page_views) as page_views,
+  count(*) as unique_page_views,
+  count(distinct merged_user_id) as users,
+  count(distinct session_id) as sessions,
+
+  -- entrances & exits
+  sum(entrances) as entrances,
+  count(distinct if(entrances > 0, session_id, null)) as entrance_sessions,
+  sum(exits) as exits,
+  safe_divide(sum(exits), sum(page_views)) as exit_rate,
+
+  -- bounce rate: of the sessions that entered on this page, the share that never engaged.
+  -- uses the session-level flag, not the per-event session_engaged param, which only
+  -- reflects engagement state at the moment the event fired
+  count(distinct if(entrances > 0 and ifnull(session_engaged, '0') != '1', session_id, null)) as bounces,
+  safe_divide(
+    count(distinct if(entrances > 0 and ifnull(session_engaged, '0') != '1', session_id, null)),
+    count(distinct if(entrances > 0, session_id, null))
+  ) as bounce_rate,
+
+  -- engagement
+  sum(engagement_time_msec) / 1000 as engagement_time_seconds,
+  safe_divide(sum(engagement_time_msec) / 1000, sum(page_views)) as avg_engagement_time_per_page_view_seconds,
+  safe_divide(sum(engagement_time_msec) / 1000, count(distinct session_id)) as avg_engagement_time_per_session_seconds,
+
+  -- page-assisted conversions: any session that viewed this page and converted,
+  -- so a conversion is credited to every page seen in that session
+  sum(conversion_events) as conversions,
+  count(distinct if(conversion_events > 0, session_id, null)) as converting_sessions,
+  safe_divide(
+    count(distinct if(conversion_events > 0, session_id, null)),
+    count(distinct session_id)
+  ) as page_conversion_rate,
+
+  current_datetime() as row_inserted_timestamp
+from
+  page_session
+group by
+  event_date,
+  page_path

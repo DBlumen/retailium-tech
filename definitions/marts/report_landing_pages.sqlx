@@ -1,0 +1,96 @@
+config {
+  type: "table",
+  description: "Session-scope landing page performance report. One row per date, landing page path, channel group and source / medium. Metric definitions follow the GA3-style landing page report.",
+  schema: "marts_ga4",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ['landing_page_path', 'primary_channel_group'],
+  },
+  tags: ['ga4_marts']
+}
+
+with prep as (
+  select
+    event_date,
+    session_id,
+    merged_user_id,
+    session_number,
+    session_engaged,
+    session_engagement_time_msec,
+    page_views,
+    conversion_events,
+    -- 4 of 131 sessions have no landing page; surface them rather than dropping them
+    coalesce(landing_page.path, '(not set)') as landing_page_path,
+    coalesce(session_traffic_source.primary_channel_group, '(not set)') as primary_channel_group,
+    coalesce(session_traffic_source.default_channel_group, '(not set)') as default_channel_group,
+    coalesce(session_traffic_source.source, '(not set)') as session_source,
+    coalesce(session_traffic_source.medium, '(not set)') as session_medium,
+    concat(
+      coalesce(session_traffic_source.source, '(not set)'),
+      ' / ',
+      coalesce(session_traffic_source.medium, '(not set)')
+    ) as source_medium
+  from
+    ${ref('sessions')}
+)
+
+select
+  event_date,
+  landing_page_path,
+  primary_channel_group,
+  default_channel_group,
+  session_source,
+  session_medium,
+  source_medium,
+
+  -- users
+  count(distinct merged_user_id) as users,
+  count(distinct if(session_number = 1, merged_user_id, null)) as new_users,
+
+  -- sessions
+  count(distinct session_id) as sessions,
+  count(distinct if(session_number = 1, session_id, null)) as new_sessions,
+  safe_divide(
+    count(distinct if(session_number = 1, session_id, null)),
+    count(distinct session_id)
+  ) as percentage_new_sessions,
+
+  -- engagement
+  count(distinct if(session_engaged = '1', session_id, null)) as engaged_sessions,
+  safe_divide(
+    count(distinct if(session_engaged = '1', session_id, null)),
+    count(distinct session_id)
+  ) as engagement_rate,
+  1 - safe_divide(
+    count(distinct if(session_engaged = '1', session_id, null)),
+    count(distinct session_id)
+  ) as bounce_rate,
+  -- divided by total sessions, matching GA4's own definition
+  safe_divide(
+    sum(session_engagement_time_msec) / 1000,
+    count(distinct session_id)
+  ) as avg_engagement_time_seconds,
+
+  -- behaviour
+  sum(page_views) as page_views,
+  safe_divide(sum(page_views), count(distinct session_id)) as pages_per_session,
+
+  -- conversions
+  sum(conversion_events) as conversions,
+  count(distinct if(conversion_events > 0, session_id, null)) as converting_sessions,
+  safe_divide(
+    count(distinct if(conversion_events > 0, session_id, null)),
+    count(distinct session_id)
+  ) as session_conversion_rate,
+
+  current_datetime() as row_inserted_timestamp
+from
+  prep
+group by
+  event_date,
+  landing_page_path,
+  primary_channel_group,
+  default_channel_group,
+  session_source,
+  session_medium,
+  source_medium

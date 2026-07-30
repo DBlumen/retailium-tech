@@ -12,6 +12,7 @@ config {
 
 js {
   const { setPreOperations, helpers } = require('ga4-export-fixer');
+  const ga4Constants = require('includes/ga4_constants');
 
   // define the configuration for the pre-operations and date filters
   const config = {
@@ -32,6 +33,11 @@ js {
         // numberOfDaysToProcess: undefined
     },
   };
+
+  // setPreOperations returns '' on a full refresh. Resolve it here so the
+  // pre_operations block below stays completely empty in that case - leaving a
+  // bare comment there makes Dataform emit a lone ';', which BigQuery rejects.
+  const preOperationsSQL = setPreOperations(config);
 }
 
 select
@@ -43,10 +49,32 @@ select
   merged_user_id,
   any_value(session_traffic_source_last_click.cross_channel_campaign) as session_traffic_source,
   any_value(landing_page) as landing_page,
+  -- the session's gclid, for joining to the Google Ads clicks table
+  -- max() over strings skips nulls, so this picks whichever source has a value
+  coalesce(
+    max(session_first_traffic_source.gclid),
+    max(collected_traffic_source.gclid),
+    max(${helpers.unnestEventParam('gclid', 'string')})
+  ) as gclid,
+  -- session number: 1 means a new user's first session
+  max(${helpers.unnestEventParam('ga_session_number', 'int')}) as session_number,
+  -- GA4 stores session_engaged as the string '1', not an integer
+  max(${helpers.unnestEventParam('session_engaged', 'string')}) as session_engaged,
+  any_value(device.category) as device_category,
+  any_value(device.web_info.browser) as browser,
+  any_value(device.operating_system) as operating_system,
+  any_value(geo.country) as country,
+  any_value(geo.region) as region,
+  any_value(geo.city) as city,
   countif(event_name = 'page_view') as page_views,
-  countif(event_name = 'book_demo') as book_demo_events,
+  -- conversion events are configured in includes/ga4_constants.js
+  countif(event_name in unnest(${ga4Constants.sqlArray(ga4Constants.CONVERSION_EVENTS)})) as conversion_events,
+  countif(event_name = 'first_visit') as first_visit_events,
+  countif(event_name = 'click') as click_events,
+  countif(event_name = 'form_start') as form_start_events,
   countif(event_name = 'video_start') as video_start_events,
   countif(event_name = 'video_finish') as video_finish_events,
+  countif(event_name = 'video_pause') as video_pause_events,
   count(*) as session_events,
   sum(
     ifnull(${helpers.unnestEventParam('engagement_time_msec', 'int')}, 0)
@@ -69,6 +97,5 @@ group by
   merged_user_id
 
 pre_operations {
-  -- the pre-operations needed for incremental refresh
-  ${setPreOperations(config)}
+  ${preOperationsSQL}
 }

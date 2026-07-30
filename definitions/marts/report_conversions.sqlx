@@ -1,0 +1,120 @@
+config {
+  type: "table",
+  description: "One row per conversion event, enriched with last-click cross-channel session attribution and a gclid for joining to Google Ads. Conversion event names are configured in includes/ga4_constants.js.",
+  schema: "marts_ga4",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ['session_id', 'gclid'],
+  },
+  tags: ['ga4_marts']
+}
+
+js {
+  const { helpers } = require('ga4-export-fixer');
+  const ga4Constants = require('includes/ga4_constants');
+}
+
+with conversion_events as (
+  select
+    event_date,
+    event_datetime,
+    event_timestamp,
+    event_name,
+    session_id,
+    user_pseudo_id,
+    user_id,
+    merged_user_id,
+
+    -- where the conversion happened
+    page_location,
+    coalesce(page.path, '(not set)') as page_path,
+    ${helpers.unnestEventParam('page_title', 'string')} as page_title,
+
+    -- gclid collected on the event itself, alongside the session-level one below
+    collected_traffic_source.gclid as event_gclid,
+
+    -- click event parameters; populated when a click event is added to CONVERSION_EVENTS.
+    -- click_id is not currently emitted by the tag and will return null until it is
+    ${helpers.unnestEventParam('click_text', 'string')} as click_text,
+    ${helpers.unnestEventParam('click_classes', 'string')} as click_classes,
+    ${helpers.unnestEventParam('click_id', 'string')} as click_id,
+    ${helpers.unnestEventParam('click_url', 'string')} as click_url,
+    ${helpers.unnestEventParam('ui_section', 'string')} as ui_section,
+
+    -- video event parameters, for when video events are added to CONVERSION_EVENTS
+    ${helpers.unnestEventParam('video_title', 'string')} as video_title,
+    ${helpers.unnestEventParam('video_url', 'string')} as video_url,
+    ${helpers.unnestEventParam('video_provider', 'string')} as video_provider,
+    ${helpers.unnestEventParam('video_percent', 'int')} as video_percent
+  from
+    ${ref('ga4_events_enhanced_543168832')}
+  where
+    event_name in unnest(${ga4Constants.sqlArray(ga4Constants.CONVERSION_EVENTS)})
+)
+
+select
+  -- keys and timing
+  e.event_date,
+  e.event_datetime,
+  time(e.event_datetime) as event_time,
+  e.event_timestamp,
+  e.event_name,
+  e.session_id,
+  e.user_pseudo_id,
+  e.user_id,
+  e.merged_user_id,
+
+  -- where the conversion happened
+  e.page_path,
+  e.page_location,
+  e.page_title,
+  coalesce(s.landing_page.path, '(not set)') as landing_page_path,
+
+  -- last-click cross-channel attribution, from the session
+  coalesce(s.session_traffic_source.primary_channel_group, '(not set)') as primary_channel_group,
+  coalesce(s.session_traffic_source.default_channel_group, '(not set)') as default_channel_group,
+  coalesce(s.session_traffic_source.source, '(not set)') as session_source,
+  coalesce(s.session_traffic_source.medium, '(not set)') as session_medium,
+  concat(
+    coalesce(s.session_traffic_source.source, '(not set)'),
+    ' / ',
+    coalesce(s.session_traffic_source.medium, '(not set)')
+  ) as source_medium,
+  s.session_traffic_source.campaign_name as campaign_name,
+  s.session_traffic_source.campaign_id as campaign_id,
+  s.session_traffic_source.source_platform as source_platform,
+
+  -- join keys for paid media
+  s.gclid,
+  e.event_gclid,
+
+  -- session context
+  s.session_number,
+  s.session_engaged,
+  s.device_category,
+  s.browser,
+  s.operating_system,
+  s.country,
+  s.region,
+  s.city,
+
+  -- click parameters
+  e.click_text,
+  e.click_classes,
+  e.click_id,
+  e.click_url,
+  e.ui_section,
+
+  -- video parameters
+  e.video_title,
+  e.video_url,
+  e.video_provider,
+  e.video_percent,
+
+  current_datetime() as row_inserted_timestamp
+from
+  conversion_events e
+left join
+  ${ref('sessions')} s
+  on e.session_id = s.session_id
+  and e.event_date = s.event_date
