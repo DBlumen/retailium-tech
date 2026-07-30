@@ -34,7 +34,7 @@ with conversion_events as (
     collected_traffic_source.gclid as event_gclid,
 
     -- click event parameters; populated when a click event is added to CONVERSION_EVENTS.
-    -- click_id is not currently emitted by the tag and will return null until it is
+    -- params the tag does not emit resolve to null
     ${helpers.unnestEventParam('click_text', 'string')} as click_text,
     ${helpers.unnestEventParam('click_classes', 'string')} as click_classes,
     ${helpers.unnestEventParam('click_id', 'string')} as click_id,

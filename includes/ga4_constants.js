@@ -7,7 +7,6 @@ conversion, add its event name to CONVERSION_EVENTS and re-run — no SQL change
 */
 
 // the main macro conversion(s)
-// note: book_demo is not firing yet, so downstream conversion counts are 0 until it does
 const CONVERSION_EVENTS = ['book_demo'];
 
 // secondary conversions, kept separate so they never inflate the headline conversion rate

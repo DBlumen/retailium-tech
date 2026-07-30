@@ -19,7 +19,7 @@ with prep as (
     session_engagement_time_msec,
     page_views,
     conversion_events,
-    -- 4 of 131 sessions have no landing page; surface them rather than dropping them
+    -- surface sessions with a null landing page rather than dropping them
     coalesce(landing_page.path, '(not set)') as landing_page_path,
     coalesce(session_traffic_source.primary_channel_group, '(not set)') as primary_channel_group,
     coalesce(session_traffic_source.default_channel_group, '(not set)') as default_channel_group,
