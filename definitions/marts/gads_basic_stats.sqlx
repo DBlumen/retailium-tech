@@ -1,6 +1,6 @@
 config {
   type: "table",
-  description: "Basic Google Ads search performance report. One row per date, campaign, ad group, ad, keyword and search term, with impressions, clicks, conversions and cost. Sourced from the Google Ads Data Transfer SearchQueryStats view and enriched with the latest Campaign / AdGroup / Ad / Keyword dimension snapshots. Google withholds search terms below its query-volume privacy threshold, so impressions, clicks, conversions and cost here cover only the disclosed terms and will total less than campaign-level spend; use a campaign or keyword grain report to reconcile against account totals.",
+  description: "Basic Google Ads search performance report. One row per date, campaign, ad group, keyword and search term, with impressions, clicks, conversions and cost. Metrics come from the full-coverage KeywordStats view, so the report reconciles to account totals. Google only publishes search terms that clear its query-volume privacy threshold; the metrics it withholds are carried on a '(not disclosed)' search_term row for the same keyword and day rather than being dropped.",
   schema: "marts_google_ads",
   bigquery: {
     partitionBy: "date",
@@ -23,8 +23,103 @@ js {
   const dayThreshold = 7;
 }
 
+-- The spine: keyword-grain metrics, which carry every click the account served.
+with keyword_stats as (
+  select
+    segments_date as date,
+    campaign_id,
+    ad_group_id,
+    ad_group_criterion_criterion_id as keyword_id,
+    sum(metrics_impressions) as impressions,
+    sum(metrics_clicks) as clicks,
+    sum(metrics_conversions) as conversions,
+    sum(metrics_cost_micros) as cost_micros
+  from
+    ${helpers.googleAdsSourceTable(source, 'KeywordStats')}
+  group by
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id
+),
+
+-- The search terms Google chose to disclose. Covers a subset of the spine above.
+search_terms as (
+  select
+    segments_date as date,
+    campaign_id,
+    ad_group_id,
+    -- criterion id out of the resource name, e.g.
+    -- 'customers/123/adGroupCriteria/456~789' -> 789. Mirrors helpers.googleAdsKeywordKeyFromStats.
+    cast(regexp_extract(segments_keyword_ad_group_criterion, r'adGroupCriteria/[0-9]+~([0-9]+)$') as int64) as keyword_id,
+    coalesce(search_term_view_search_term, '(not set)') as search_term,
+    sum(metrics_impressions) as impressions,
+    sum(metrics_clicks) as clicks,
+    sum(metrics_conversions) as conversions,
+    sum(metrics_cost_micros) as cost_micros
+  from
+    ${helpers.googleAdsSourceTable(source, 'SearchQueryStats')}
+  group by
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id,
+    search_term
+),
+
+-- What the disclosed terms account for, rolled back up to the spine's grain.
+disclosed as (
+  select
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id,
+    sum(impressions) as impressions,
+    sum(clicks) as clicks,
+    sum(conversions) as conversions,
+    sum(cost_micros) as cost_micros
+  from
+    search_terms
+  group by
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id
+),
+
+-- The remainder: activity on terms Google withheld. Keeping it as its own row is what
+-- lets the report total to the same numbers as the Google Ads UI.
+withheld as (
+  select
+    k.date,
+    k.campaign_id,
+    k.ad_group_id,
+    k.keyword_id,
+    '(not disclosed)' as search_term,
+    k.impressions - coalesce(d.impressions, 0) as impressions,
+    k.clicks - coalesce(d.clicks, 0) as clicks,
+    k.conversions - coalesce(d.conversions, 0) as conversions,
+    k.cost_micros - coalesce(d.cost_micros, 0) as cost_micros
+  from
+    keyword_stats k
+  left join
+    disclosed d
+    using (date, campaign_id, ad_group_id, keyword_id)
+  where
+    k.impressions - coalesce(d.impressions, 0) > 0
+    or k.clicks - coalesce(d.clicks, 0) > 0
+    or k.conversions - coalesce(d.conversions, 0) > 0
+    or k.cost_micros - coalesce(d.cost_micros, 0) > 0
+),
+
+combined as (
+  select * from search_terms
+  union all
+  select * from withheld
+),
+
 -- Dimension views hold one snapshot per day; the latest one is the current state.
-with campaigns as (
+campaigns as (
   select
     campaign_id,
     any_value(campaign_name) as campaign_name
@@ -48,53 +143,10 @@ ad_groups as (
     ad_group_id
 ),
 
-ads as (
-  select
-    ad_group_id,
-    ad_group_ad_ad_id as ad_id,
-    any_value(ad_group_ad_ad_type) as ad_type,
-    -- Responsive search ads carry no ad name, so label them with their first three
-    -- headlines; the id alone is not readable in a report.
-    any_value(coalesce(
-      nullif(ad_group_ad_ad_name, ''),
-      nullif(
-        array_to_string(
-          array(
-            select json_value(headline, '$.text')
-            from unnest(json_extract_array(ad_group_ad_ad_responsive_search_ad_headlines)) as headline
-              with offset as headline_index
-            order by headline_index
-            limit 3
-          ),
-          ' | '
-        ),
-        ''
-      ),
-      nullif(
-        array_to_string(
-          [
-            ad_group_ad_ad_expanded_text_ad_headline_part1,
-            ad_group_ad_ad_expanded_text_ad_headline_part2,
-            ad_group_ad_ad_expanded_text_ad_headline_part3
-          ],
-          ' | '
-        ),
-        ''
-      ),
-      cast(ad_group_ad_ad_id as string)
-    )) as ad_name
-  from
-    ${helpers.googleAdsSourceTable(source, 'Ad')}
-  where
-    ${helpers.googleAdsLatestSnapshotFilter}
-  group by
-    ad_group_id,
-    ad_id
-),
-
 keywords as (
   select
-    ${helpers.googleAdsKeywordKey} as keyword_key,
+    ad_group_id,
+    ad_group_criterion_criterion_id as keyword_id,
     any_value(ad_group_criterion_keyword_text) as keyword,
     any_value(ad_group_criterion_keyword_match_type) as keyword_match_type
   from
@@ -102,7 +154,8 @@ keywords as (
   where
     ${helpers.googleAdsLatestSnapshotFilter}
   group by
-    keyword_key
+    ad_group_id,
+    keyword_id
 ),
 
 -- Account currency, the unit for the cost column. One row.
@@ -116,61 +169,43 @@ customer as (
 )
 
 select
-  stats.segments_date as date,
+  combined.date,
 
   -- entities, from the latest dimension snapshots
-  stats.campaign_id,
+  combined.campaign_id,
   campaigns.campaign_name,
-  stats.ad_group_id,
+  combined.ad_group_id,
   ad_groups.ad_group_name,
-  stats.ad_group_ad_ad_id as ad_id,
-  ads.ad_name,
-  ads.ad_type,
-  keywords.keyword,
-  keywords.keyword_match_type,
-  coalesce(stats.search_term_view_search_term, '(not set)') as search_term,
+  combined.keyword_id,
+  -- keywords removed from the account since the click keep their metrics but lose their name
+  coalesce(keywords.keyword, '(not set)') as keyword,
+  coalesce(keywords.keyword_match_type, '(not set)') as keyword_match_type,
+  combined.search_term,
 
   customer.currency,
 
   -- metrics, summed across device / ad network to the grain above
-  sum(stats.metrics_impressions) as impressions,
-  sum(stats.metrics_clicks) as clicks,
-  safe_divide(sum(stats.metrics_clicks), sum(stats.metrics_impressions)) as ctr,
+  combined.impressions,
+  combined.clicks,
+  safe_divide(combined.clicks, combined.impressions) as ctr,
   -- fractional; Google Ads attributes conversions fractionally
-  sum(stats.metrics_conversions) as conversions,
-  safe_divide(sum(stats.metrics_conversions), sum(stats.metrics_clicks)) as conversion_rate,
+  combined.conversions,
+  safe_divide(combined.conversions, combined.clicks) as conversion_rate,
   -- cost is stored in millionths of the account currency
-  sum(stats.metrics_cost_micros) / 1000000 as cost,
+  combined.cost_micros / 1000000 as cost,
 
-  ${helpers.googleAdsDataIsFinal('stats.segments_date', dayThreshold)} as data_is_final,
+  ${helpers.googleAdsDataIsFinal('combined.date', dayThreshold)} as data_is_final,
   current_datetime() as row_inserted_timestamp
 from
-  ${helpers.googleAdsSourceTable(source, 'SearchQueryStats')} stats
+  combined
 left join
   campaigns
-  on stats.campaign_id = campaigns.campaign_id
+  using (campaign_id)
 left join
   ad_groups
-  on stats.ad_group_id = ad_groups.ad_group_id
-left join
-  ads
-  on stats.ad_group_id = ads.ad_group_id
-  and stats.ad_group_ad_ad_id = ads.ad_id
+  using (ad_group_id)
 left join
   keywords
-  on keywords.keyword_key = ${helpers.googleAdsKeywordKeyFromStats('stats.segments_keyword_ad_group_criterion')}
+  using (ad_group_id, keyword_id)
 cross join
   customer
-group by
-  date,
-  campaign_id,
-  campaign_name,
-  ad_group_id,
-  ad_group_name,
-  ad_id,
-  ad_name,
-  ad_type,
-  keyword,
-  keyword_match_type,
-  search_term,
-  currency
