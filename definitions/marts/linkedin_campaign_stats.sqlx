@@ -1,0 +1,139 @@
+config {
+  type: "table",
+  description: "LinkedIn Ads performance report at campaign grain. One row per date, campaign and ad group, with impressions, clicks, cost, conversion and engagement metrics. Sourced from the Airbyte LinkedIn connector's ad_campaign_analytics table and enriched with the latest Account / CampaignGroup / Campaign dimension rows. Column names follow the Google Ads convention: LinkedIn's campaign group is reported as campaign and its campaign as ad group. Scoped to the Retailium ad account only - the source dataset also carries another advertiser's campaigns. This is the reconciliation table: unlike linkedin_basic_stats it covers every campaign that spent, including those that ran no creatives, so its cost totals match the LinkedIn UI.",
+  schema: "marts_linkedin_ads",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ['campaign_name', 'ad_group_name'],
+  },
+  tags: ['linkedin_ads', 'linkedin_ads_marts']
+}
+
+js {
+  const li = require('includes/linkedin_constants');
+}
+
+-- LinkedIn's hierarchy is Account > Campaign Group > Campaign > Creative. It is
+-- reported here one level shifted, so the columns match the Google Ads mart:
+--   campaign group -> campaign_id / campaign_name
+--   campaign       -> ad_group_id / ad_group_name
+
+-- Account currency, the unit for the cost column. One row.
+with account as (
+  select
+    cast(id as string) as account_id,
+    name as account_name,
+    currency
+  from
+    ${ref('accounts')}
+  where
+    cast(id as string) = '${li.RETAILIUM_ACCOUNT_ID}'
+  ${li.latestRow(['id'])}
+),
+
+campaign_groups as (
+  select
+    cast(id as string) as campaign_group_id,
+    name as campaign_group_name
+  from
+    ${ref('campaign_groups')}
+  where
+    account = '${li.RETAILIUM_ACCOUNT_URN}'
+  ${li.latestRow(['id'])}
+),
+
+campaigns as (
+  select
+    cast(id as string) as campaign_id,
+    name as campaign_name,
+    ${li.urnId('campaignGroup')} as campaign_group_id,
+    format as ad_format,
+    objectiveType as objective,
+    costType as cost_type,
+    status as campaign_status
+  from
+    ${ref('campaigns')}
+  where
+    account = '${li.RETAILIUM_ACCOUNT_URN}'
+  ${li.latestRow(['id'])}
+)
+
+select
+  stats.start_date as date,
+
+  -- entities, from the latest dimension rows
+  safe_cast(account.account_id as int64) as account_id,
+  account.account_name,
+  safe_cast(campaigns.campaign_group_id as int64) as campaign_id,
+  -- Several campaign groups the campaigns point at were never synced by the
+  -- connector, so fall back to the id rather than losing the row's identity.
+  coalesce(
+    campaign_groups.campaign_group_name,
+    'Campaign group ' || campaigns.campaign_group_id,
+    '(not set)'
+  ) as campaign_name,
+  safe_cast(campaigns.campaign_id as int64) as ad_group_id,
+  coalesce(campaigns.campaign_name, '(not set)') as ad_group_name,
+
+  coalesce(campaigns.ad_format, '(not set)') as ad_format,
+  coalesce(campaigns.objective, '(not set)') as objective,
+  coalesce(campaigns.cost_type, '(not set)') as cost_type,
+  account.currency,
+
+  -- metrics. The source columns are NUMERIC; counts are cast to int64 and money to
+  -- float64 so the shared columns match gads_basic_stats type for type.
+  -- Nulls are left to sum() to skip rather than coalesced to zero: the most recent
+  -- day arrives with impressions but no clicks or cost, and data_is_final flags it.
+  cast(sum(stats.impressions) as int64) as impressions,
+  cast(sum(stats.clicks) as int64) as clicks,
+  cast(safe_divide(sum(stats.clicks), sum(stats.impressions)) as float64) as ctr,
+  cast(sum(stats.costInLocalCurrency) as float64) as cost,
+  cast(safe_divide(sum(stats.costInLocalCurrency), sum(stats.clicks)) as float64) as cpc,
+  cast(safe_divide(sum(stats.costInLocalCurrency), sum(stats.impressions)) * 1000 as float64) as cpm,
+
+  -- conversions. LinkedIn has no single metric equivalent to Google's conversions
+  -- column; externalWebsiteConversions is the closest and is used as the headline.
+  cast(sum(stats.externalWebsiteConversions) as float64) as conversions,
+  cast(safe_divide(sum(stats.externalWebsiteConversions), sum(stats.clicks)) as float64) as conversion_rate,
+  cast(sum(stats.externalWebsitePostClickConversions) as float64) as post_click_conversions,
+  cast(sum(stats.externalWebsitePostViewConversions) as float64) as post_view_conversions,
+  cast(sum(stats.oneClickLeads) as int64) as one_click_leads,
+  cast(sum(stats.conversionValueInLocalCurrency) as float64) as conversion_value,
+
+  -- engagement. Most Retailium campaigns are boosted-post engagement campaigns, so
+  -- these carry more signal than the conversion columns.
+  cast(sum(stats.likes) as int64) as likes,
+  cast(sum(stats.comments) as int64) as comments,
+  cast(sum(stats.shares) as int64) as shares,
+  cast(sum(stats.follows) as int64) as follows,
+  cast(sum(stats.companyPageClicks) as int64) as company_page_clicks,
+  cast(sum(stats.landingPageClicks) as int64) as landing_page_clicks,
+  cast(sum(stats.totalEngagements) as int64) as total_engagements,
+  cast(safe_divide(sum(stats.totalEngagements), sum(stats.impressions)) as float64) as engagement_rate,
+
+  ${li.dataIsFinal('stats.start_date')} as data_is_final,
+  current_datetime() as row_inserted_timestamp
+from
+  ${ref('ad_campaign_analytics')} stats
+-- Inner join: the analytics tables carry no account column, so this dimension join
+-- is what confines the mart to the Retailium account.
+inner join
+  campaigns
+  on campaigns.campaign_id = stats.sponsoredCampaign
+left join
+  campaign_groups
+  on campaign_groups.campaign_group_id = campaigns.campaign_group_id
+cross join
+  account
+group by
+  date,
+  account_id,
+  account_name,
+  campaign_id,
+  campaign_name,
+  ad_group_id,
+  ad_group_name,
+  ad_format,
+  objective,
+  cost_type,
+  currency
