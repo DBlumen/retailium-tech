@@ -10,11 +10,11 @@ conversion, add its event name to CONVERSION_EVENTS and re-run — no SQL change
 const CONVERSION_EVENTS = ['book_demo'];
 
 // secondary conversions, kept separate so they never inflate the headline conversion rate
-// e.g. ['form_start', 'video_finish']
+// e.g. ['form_start', 'video_end']
 const MICRO_CONVERSION_EVENTS = [];
 
 // video tracking events
-const VIDEO_EVENTS = ['video_start', 'video_finish', 'video_pause'];
+const VIDEO_EVENTS = ['video_start', 'video_end'];
 
 /**
  * Renders a JS array of strings as a SQL array literal, for use with

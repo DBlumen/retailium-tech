@@ -1,6 +1,6 @@
 config {
   type: "table",
-  description: "Basic Google Ads search performance report. One row per date, campaign, ad group, keyword and search term, with impressions, clicks, conversions and cost. Metrics come from the full-coverage KeywordStats view, so the report reconciles to account totals. Google only publishes search terms that clear its query-volume privacy threshold; the metrics it withholds are carried on a '(not disclosed)' search_term row for the same keyword and day rather than being dropped.",
+  description: "Basic Google Ads search performance report. One row per date, campaign, ad group, keyword and search term, with impressions, clicks, conversions and cost. Metrics come from the full-coverage KeywordStats view, so the report reconciles to account totals. Google only publishes search terms that clear its query-volume privacy threshold; the metrics it withholds are carried on a '(not disclosed)' search_term row for the same keyword and day rather than being dropped. Conversions are additionally broken out into one metric column per conversion action configured in includes/google_ads_constants.js, with a conversions_other remainder so the per-action columns always sum to the total.",
   schema: "marts_google_ads",
   bigquery: {
     partitionBy: "date",
@@ -11,6 +11,7 @@ config {
 
 js {
   const { helpers } = require('ga4-export-fixer');
+  const gadsConstants = require('includes/google_ads_constants');
 
   // Same Google Ads Data Transfer account as definitions/google_ads_clicks.js
   const source = {
@@ -118,6 +119,115 @@ combined as (
   select * from withheld
 ),
 
+-- The conversion-action layer repeats the spine / disclosed / withheld construction above,
+-- one grain deeper. The ConversionStats views total to the same conversions as the stats
+-- views they shadow, so splitting by action costs nothing in reconciliation.
+keyword_conversion_actions as (
+  select
+    segments_date as date,
+    campaign_id,
+    ad_group_id,
+    ad_group_criterion_criterion_id as keyword_id,
+    -- id out of the resource name, e.g. 'customers/123/conversionActions/456' -> 456
+    cast(regexp_extract(segments_conversion_action, r'conversionActions/([0-9]+)$') as int64) as conversion_action_id,
+    sum(metrics_conversions) as conversions
+  from
+    ${helpers.googleAdsSourceTable(source, 'KeywordConversionStats')}
+  group by
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id,
+    conversion_action_id
+),
+
+-- Per-action conversions on the search terms Google disclosed.
+search_term_conversion_actions as (
+  select
+    segments_date as date,
+    campaign_id,
+    ad_group_id,
+    cast(regexp_extract(segments_keyword_ad_group_criterion, r'adGroupCriteria/[0-9]+~([0-9]+)$') as int64) as keyword_id,
+    coalesce(search_term_view_search_term, '(not set)') as search_term,
+    cast(regexp_extract(segments_conversion_action, r'conversionActions/([0-9]+)$') as int64) as conversion_action_id,
+    sum(metrics_conversions) as conversions
+  from
+    ${helpers.googleAdsSourceTable(source, 'SearchQueryConversionStats')}
+  group by
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id,
+    search_term,
+    conversion_action_id
+),
+
+disclosed_conversion_actions as (
+  select
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id,
+    conversion_action_id,
+    sum(conversions) as conversions
+  from
+    search_term_conversion_actions
+  group by
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id,
+    conversion_action_id
+),
+
+-- Conversions on withheld terms, landing on the same '(not disclosed)' rows the
+-- aggregate metrics already use.
+withheld_conversion_actions as (
+  select
+    k.date,
+    k.campaign_id,
+    k.ad_group_id,
+    k.keyword_id,
+    '(not disclosed)' as search_term,
+    k.conversion_action_id,
+    k.conversions - coalesce(d.conversions, 0) as conversions
+  from
+    keyword_conversion_actions k
+  left join
+    disclosed_conversion_actions d
+    using (date, campaign_id, ad_group_id, keyword_id, conversion_action_id)
+  where
+    k.conversions - coalesce(d.conversions, 0) > 0
+),
+
+combined_conversion_actions as (
+  select * from search_term_conversion_actions
+  union all
+  select * from withheld_conversion_actions
+),
+
+-- One row per grain key again, with the actions pivoted out into columns.
+-- The action list lives in includes/google_ads_constants.js.
+conversion_action_metrics as (
+  select
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id,
+    search_term,
+${gadsConstants.conversionActionPivot()},
+    -- everything the pivot covered, for the conversions_other remainder below
+    sum(conversions) as conversions_by_action_total
+  from
+    combined_conversion_actions
+  group by
+    date,
+    campaign_id,
+    ad_group_id,
+    keyword_id,
+    search_term
+),
+
 -- Dimension views hold one snapshot per day; the latest one is the current state.
 campaigns as (
   select
@@ -191,6 +301,13 @@ select
   -- fractional; Google Ads attributes conversions fractionally
   combined.conversions,
   safe_divide(combined.conversions, combined.clicks) as conversion_rate,
+
+  -- the same conversions, split by conversion action
+${gadsConstants.conversionActionColumns('conversion_action_metrics')},
+  -- conversions booked against an action the config does not name; keeps the per-action
+  -- columns plus this one summing to the conversions column above
+  combined.conversions - coalesce(conversion_action_metrics.conversions_by_action_total, 0) as conversions_other,
+
   -- cost is stored in millionths of the account currency
   combined.cost_micros / 1000000 as cost,
 
@@ -207,5 +324,14 @@ left join
 left join
   keywords
   using (ad_group_id, keyword_id)
+-- joined on the full grain rather than with `using`, whose columns the dimension
+-- joins above have already coalesced
+left join
+  conversion_action_metrics
+  on combined.date = conversion_action_metrics.date
+  and combined.campaign_id = conversion_action_metrics.campaign_id
+  and combined.ad_group_id = conversion_action_metrics.ad_group_id
+  and combined.keyword_id = conversion_action_metrics.keyword_id
+  and combined.search_term = conversion_action_metrics.search_term
 cross join
   customer

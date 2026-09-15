@@ -73,8 +73,7 @@ select
   countif(event_name = 'click') as click_events,
   countif(event_name = 'form_start') as form_start_events,
   countif(event_name = 'video_start') as video_start_events,
-  countif(event_name = 'video_finish') as video_finish_events,
-  countif(event_name = 'video_pause') as video_pause_events,
+  countif(event_name = 'video_end') as video_end_events,
   count(*) as session_events,
   sum(
     ifnull(${helpers.unnestEventParam('engagement_time_msec', 'int')}, 0)
