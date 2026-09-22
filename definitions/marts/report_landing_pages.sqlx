@@ -1,10 +1,10 @@
 config {
   type: "table",
-  description: "Session-scope landing page performance report. One row per date, landing page path, channel group and source / medium. Metric definitions follow the GA3-style landing page report.",
+  description: "Session-scope landing page performance report. One row per date, landing page path, channel group, source / medium, campaign, ad group and keyword. Metric definitions follow the GA3-style landing page report. The campaign, ad group and keyword dimensions are read from the utm parameters of the Google Ads tracking template, so traffic tagged without them reads '(not set)'.",
   schema: "marts_ga4",
   bigquery: {
     partitionBy: "event_date",
-    clusterBy: ['landing_page_path', 'primary_channel_group'],
+    clusterBy: ['landing_page_path', 'primary_channel_group', 'campaign_name', 'keyword'],
   },
   tags: ['ga4_marts']
 }
@@ -30,7 +30,14 @@ with prep as (
       coalesce(session_traffic_source.source, '(not set)'),
       ' / ',
       coalesce(session_traffic_source.medium, '(not set)')
-    ) as source_medium
+    ) as source_medium,
+    -- the Google Ads tracking template's utm parameters, one dimension each. utm_source
+    -- and utm_medium are already represented by the source / medium columns above, which
+    -- GA4 populates from exactly those two parameters
+    coalesce(utm_campaign_name, '(not set)') as campaign_name,
+    coalesce(utm_campaign_id, '(not set)') as campaign_id,
+    coalesce(utm_ad_group_id, '(not set)') as ad_group_id,
+    coalesce(utm_keyword, '(not set)') as keyword
   from
     ${ref('sessions')}
 )
@@ -43,6 +50,10 @@ select
   session_source,
   session_medium,
   source_medium,
+  campaign_name,
+  campaign_id,
+  ad_group_id,
+  keyword,
 
   -- users
   count(distinct merged_user_id) as users,
@@ -97,4 +108,8 @@ group by
   default_channel_group,
   session_source,
   session_medium,
-  source_medium
+  source_medium,
+  campaign_name,
+  campaign_id,
+  ad_group_id,
+  keyword

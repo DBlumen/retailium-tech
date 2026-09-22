@@ -38,6 +38,21 @@ js {
   // pre_operations block below stays completely empty in that case - leaving a
   // bare comment there makes Dataform emit a lone ';', which BigQuery rejects.
   const preOperationsSQL = setPreOperations(config);
+
+  /*
+  The Google Ads account-level tracking template tags every click with utm parameters.
+  Each one lands in two places: the session-scoped last-click attribution struct, and the
+  traffic source collected on the event itself. Prefer the attributed value and fall back
+  to what was collected, the same order the gclid below resolves in.
+
+  GA4 writes the literal string '(not set)' into manual_campaign for sessions that carried
+  no utm parameters at all, which would win a plain coalesce ahead of the fallback.
+  */
+  const utmField = (lastClickField, collectedField) => `coalesce(
+    max(nullif(session_traffic_source_last_click.manual_campaign.${lastClickField}, '(not set)')),
+    max(session_first_traffic_source.${collectedField}),
+    max(collected_traffic_source.${collectedField})
+  )`;
 }
 
 select
@@ -56,6 +71,14 @@ select
     max(collected_traffic_source.gclid),
     max(${helpers.unnestEventParam('gclid', 'string')})
   ) as gclid,
+  -- the tracking template's utm parameters. utm_content carries the ad group id and
+  -- utm_term the keyword, so the two are named for what the template puts in them
+  ${utmField('source', 'manual_source')} as utm_source,
+  ${utmField('medium', 'manual_medium')} as utm_medium,
+  ${utmField('campaign_name', 'manual_campaign_name')} as utm_campaign_name,
+  ${utmField('campaign_id', 'manual_campaign_id')} as utm_campaign_id,
+  ${utmField('content', 'manual_content')} as utm_ad_group_id,
+  ${utmField('term', 'manual_term')} as utm_keyword,
   -- session number: 1 means a new user's first session
   max(${helpers.unnestEventParam('ga_session_number', 'int')}) as session_number,
   -- GA4 stores session_engaged as the string '1', not an integer
