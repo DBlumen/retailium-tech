@@ -5,8 +5,8 @@ config {
   bigquery: {
     partitionBy: "event_date",
     clusterBy: ['page_path'],
-    labels: {
-      reporting_ready: true
+   labels: {
+      status: "reporting_ready"
     }
   },
   tags: ['ga4_marts']
