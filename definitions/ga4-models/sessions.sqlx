@@ -5,7 +5,9 @@ config {
   bigquery: {
     partitionBy: "event_date",
     clusterBy: ['session_id', 'data_is_final'],
-    labels:['reporting_ready']
+   labels: {
+      reporting_ready: true
+    }
   },
   // include the same ga4_export_fixer tag that the event table has
   tags: ['ga4_export_fixer']
