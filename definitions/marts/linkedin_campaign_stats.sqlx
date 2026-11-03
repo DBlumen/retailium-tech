@@ -5,6 +5,7 @@ config {
   bigquery: {
     partitionBy: "date",
     clusterBy: ['campaign_name', 'ad_group_name'],
+    labels:['reporting_ready']
   },
   tags: ['linkedin_ads', 'linkedin_ads_marts']
 }
