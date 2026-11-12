@@ -5,6 +5,9 @@ config {
   bigquery: {
     partitionBy: "event_date",
     clusterBy: ['primary_channel_group', 'campaign_name'],
+    labels: {
+      status: "reporting_ready"
+    }
   },
   tags: ['ga4_marts']
 }
