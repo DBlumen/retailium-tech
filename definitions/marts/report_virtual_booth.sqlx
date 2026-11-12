@@ -1,0 +1,150 @@
+config {
+  type: "table",
+  description: "Virtual booth page report (retailium.tech/virtual-booth). One row per date, channel group, source / medium, campaign and utm_content. Covers every session that viewed the page or fired a vb_ event: page views, video, PDF and LinkedIn interactions. The landing_* metrics cover only the sessions that entered the site on the page. The page and event patterns are configured in includes/ga4_constants.js.",
+  schema: "marts_ga4",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ['primary_channel_group', 'campaign_name'],
+  },
+  tags: ['ga4_marts']
+}
+
+js {
+  const { VIRTUAL_BOOTH: vb } = require('includes/ga4_constants');
+
+  // true when a page struct (hostname, path) is the production virtual booth page
+  const isBoothPage = (pageStruct) => `(
+    ${pageStruct}.hostname = '${vb.hostname}'
+    and regexp_contains(${pageStruct}.path, r'${vb.pathRegex}')
+  )`;
+}
+
+-- every event on the page, plus any vb_ event: those only fire on the page, so they are
+-- kept even if their page path ever comes through differently
+with booth_events as (
+  select
+    event_date,
+    session_id,
+    merged_user_id,
+    event_name
+  from
+    ${ref('ga4_events_enhanced_543168832')}
+  where
+    page.hostname = '${vb.hostname}'
+    and (
+      regexp_contains(page.path, r'${vb.pathRegex}')
+      or regexp_contains(event_name, r'${vb.eventRegex}')
+    )
+),
+
+-- one row per session, so session-level flags joined below are counted once
+booth_sessions as (
+  select
+    event_date,
+    session_id,
+    any_value(merged_user_id) as merged_user_id,
+    countif(event_name = 'page_view') as page_views,
+    countif(regexp_contains(event_name, r'${vb.eventRegex}')) as booth_events,
+    countif(regexp_contains(event_name, r'${vb.videoEventRegex}')) as video_events,
+    countif(event_name = 'vb_video_start') as video_starts,
+    countif(event_name = 'vb_video_end') as video_completes,
+    countif(regexp_contains(event_name, r'${vb.pdfEventRegex}')) as pdf_events,
+    countif(event_name = 'vb_pdf_open') as pdf_opens,
+    countif(event_name = 'vb_pdf_page') as pdf_page_views,
+    countif(regexp_contains(event_name, r'${vb.linkedinEventRegex}')) as linkedin_clicks
+  from
+    booth_events
+  group by
+    event_date,
+    session_id
+),
+
+prep as (
+  select
+    b.*,
+    s.session_number,
+    s.session_engaged,
+    ifnull(s.session_engagement_time_msec, 0) as session_engagement_time_msec,
+    ifnull(${isBoothPage('s.landing_page')}, false) as is_landing,
+    coalesce(s.session_traffic_source.primary_channel_group, '(not set)') as primary_channel_group,
+    coalesce(s.session_traffic_source.source, '(not set)') as session_source,
+    coalesce(s.session_traffic_source.medium, '(not set)') as session_medium,
+    concat(
+      coalesce(s.session_traffic_source.source, '(not set)'),
+      ' / ',
+      coalesce(s.session_traffic_source.medium, '(not set)')
+    ) as source_medium,
+    coalesce(s.utm_campaign_name, '(not set)') as campaign_name,
+    -- the sessions model names utm_content for the Google Ads template, which puts the
+    -- ad group id there. Offline links to this page use it for the handout item instead
+    coalesce(s.utm_ad_group_id, '(not set)') as utm_content
+  from
+    booth_sessions b
+  left join
+    ${ref('sessions')} s
+    on b.session_id = s.session_id
+    and b.event_date = s.event_date
+)
+
+select
+  event_date,
+  primary_channel_group,
+  session_source,
+  session_medium,
+  source_medium,
+  campaign_name,
+  utm_content,
+
+  -- every session that saw the page, wherever it entered the site
+  count(distinct merged_user_id) as users,
+  count(distinct if(session_number = 1, merged_user_id, null)) as new_users,
+  count(distinct session_id) as sessions,
+  count(distinct if(session_engaged = '1', session_id, null)) as engaged_sessions,
+  sum(page_views) as page_views,
+
+  -- sessions that entered the site on the page
+  count(distinct if(is_landing, session_id, null)) as landing_sessions,
+  count(distinct if(is_landing and session_engaged = '1', session_id, null)) as landing_engaged_sessions,
+  safe_divide(
+    count(distinct if(is_landing and session_engaged = '1', session_id, null)),
+    count(distinct if(is_landing, session_id, null))
+  ) as landing_engagement_rate,
+  1 - safe_divide(
+    count(distinct if(is_landing and session_engaged = '1', session_id, null)),
+    count(distinct if(is_landing, session_id, null))
+  ) as landing_bounce_rate,
+  -- divided by total landing sessions, matching GA4's own definition
+  safe_divide(
+    sum(if(is_landing, session_engagement_time_msec, 0)) / 1000,
+    count(distinct if(is_landing, session_id, null))
+  ) as landing_avg_engagement_time_seconds,
+
+  -- any vb_ interaction
+  sum(booth_events) as booth_events,
+  count(distinct if(booth_events > 0, session_id, null)) as interacting_sessions,
+
+  -- video
+  sum(video_starts) as video_starts,
+  sum(video_completes) as video_completes,
+  count(distinct if(video_events > 0, session_id, null)) as video_sessions,
+
+  -- pdf
+  sum(pdf_opens) as pdf_opens,
+  sum(pdf_page_views) as pdf_page_views,
+  count(distinct if(pdf_events > 0, session_id, null)) as pdf_sessions,
+
+  -- linkedin
+  sum(linkedin_clicks) as linkedin_clicks,
+  count(distinct if(linkedin_clicks > 0, session_id, null)) as linkedin_click_sessions,
+
+  current_datetime() as row_inserted_timestamp
+from
+  prep
+group by
+  event_date,
+  primary_channel_group,
+  session_source,
+  session_medium,
+  source_medium,
+  campaign_name,
+  utm_content

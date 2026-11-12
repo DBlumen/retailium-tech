@@ -16,6 +16,21 @@ const MICRO_CONVERSION_EVENTS = [];
 // video tracking events
 const VIDEO_EVENTS = ['video_start', 'video_end'];
 
+/*
+The virtual booth landing page (https://retailium.tech/virtual-booth). Only the production
+hostname counts, so traffic on preview / staging builds of the site stays out of the report.
+Every event that fires only on this page carries the vb_ prefix; the regexes group them by
+the feature they measure, so a new event under an existing prefix is counted without SQL changes.
+*/
+const VIRTUAL_BOOTH = {
+  hostname: 'retailium.tech',
+  pathRegex: '^/virtual-booth/?$',
+  eventRegex: '^vb_',
+  videoEventRegex: '^vb_video',
+  pdfEventRegex: '^vb_pdf',
+  linkedinEventRegex: '^vb_linkedin_click'
+};
+
 /**
  * Renders a JS array of strings as a SQL array literal, for use with
  * `event_name in unnest(...)`.
@@ -40,5 +55,6 @@ module.exports = {
   CONVERSION_EVENTS,
   MICRO_CONVERSION_EVENTS,
   VIDEO_EVENTS,
+  VIRTUAL_BOOTH,
   sqlArray
 };
